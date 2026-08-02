@@ -38,6 +38,39 @@ async function fetchText(url) {
   return new TextDecoder("big5").decode(buf);
 }
 
+function decodeHtmlEntities(s) {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+async function fetchNews(query, hl, gl, ceid, count) {
+  const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=${hl}&gl=${gl}&ceid=${ceid}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const xml = await res.text();
+    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, count);
+    return items.map((m) => {
+      const block = m[1];
+      const rawTitle = decodeHtmlEntities((block.match(/<title>([\s\S]*?)<\/title>/) || [])[1] || "");
+      const link = (block.match(/<link>([\s\S]*?)<\/link>/) || [])[1] || "";
+      const pubDate = (block.match(/<pubDate>([\s\S]*?)<\/pubDate>/) || [])[1] || "";
+      const source = decodeHtmlEntities(
+        (block.match(/<source[^>]*>([\s\S]*?)<\/source>/) || [])[1] || ""
+      );
+      const suffix = ` - ${source}`;
+      const title = source && rawTitle.endsWith(suffix) ? rawTitle.slice(0, -suffix.length) : rawTitle;
+      return { title, link, source, pubDate };
+    });
+  } catch {
+    return [];
+  }
+}
+
 function quarterLabel(dateStr) {
   // "2022-03-31" -> "2022 Q1"
   const [y, m] = dateStr.split("-");
@@ -191,12 +224,14 @@ function parseIndustryMap(html) {
 }
 
 async function main() {
-  const [twseStocks, twseIndex, tpexStocks, isinTwseHtml, isinTpexHtml] = await Promise.all([
+  const [twseStocks, twseIndex, tpexStocks, isinTwseHtml, isinTpexHtml, newsTw, newsUs] = await Promise.all([
     fetchJson("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"),
     fetchJson("https://openapi.twse.com.tw/v1/indicesReport/MI_5MINS_HIST"),
     fetchJson("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"),
     fetchText("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"),
     fetchText("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"),
+    fetchNews("台股 大盤", "zh-TW", "TW", "TW:zh-Hant", 5),
+    fetchNews("US stock market", "en-US", "US", "US:en", 5),
   ]);
 
   const industryMap = { ...parseIndustryMap(isinTwseHtml), ...parseIndustryMap(isinTpexHtml) };
@@ -335,6 +370,7 @@ async function main() {
       changePct: taiexChangePct,
       history: taiexHistory,
     },
+    news: { tw: newsTw, us: newsUs },
     watchlist,
     topByValue: byValue,
     topByVolume: byVolume,
