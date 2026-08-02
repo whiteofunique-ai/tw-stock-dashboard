@@ -1,4 +1,10 @@
 // 抓取台股每日資料並整理成儀表板要用的 JSON
+import fs from "node:fs";
+
+const HISTORY_FILE = "institutional_history.json";
+const HISTORY_DAYS = 30;
+const MIN_DUAL_BUY_STREAK = 2;
+
 const WATCHLIST = [
   { code: "2330", name: "台積電" },
   { code: "2454", name: "聯發科" },
@@ -202,6 +208,49 @@ async function fetchMarketInstitutionalSummary(queryDate) {
   }
 }
 
+// ---- 外資／投信連買追蹤（跨日滾動歷史，存在 institutional_history.json）----
+function loadInstitutionalHistory() {
+  try {
+    return JSON.parse(fs.readFileSync(HISTORY_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function updateInstitutionalHistory(history, dataDate, instRows) {
+  instRows.forEach((r) => {
+    const entry = history[r.code] || { days: [] };
+    entry.name = r.name;
+    entry.market = r.market;
+    entry.industry = r.industry;
+    entry.days = entry.days.filter((d) => d.date !== dataDate);
+    entry.days.push({ date: dataDate, f: r.foreignNet > 0, t: r.trustNet > 0 });
+    entry.days.sort((a, b) => (a.date > b.date ? 1 : a.date < b.date ? -1 : 0));
+    entry.days = entry.days.slice(-HISTORY_DAYS);
+    history[r.code] = entry;
+  });
+  return history;
+}
+
+function computeDualBuyStreaks(history, nameLookup) {
+  const results = [];
+  for (const [code, entry] of Object.entries(history)) {
+    let streak = 0;
+    for (let i = entry.days.length - 1; i >= 0; i--) {
+      const d = entry.days[i];
+      if (d.f && d.t) streak++;
+      else break;
+    }
+    if (streak >= MIN_DUAL_BUY_STREAK) {
+      const info = nameLookup.get(code);
+      if (!info) continue;
+      results.push({ ...info, streak });
+    }
+  }
+  results.sort((a, b) => b.streak - a.streak || b.value - a.value);
+  return results.slice(0, 20);
+}
+
 function parseIndustryMap(html) {
   const map = {};
   const rowRe = /<tr>([\s\S]*?)<\/tr>/g;
@@ -339,10 +388,15 @@ async function main() {
   const trustBuyTop10 = [...instRows].sort((a, b) => b.trustNet - a.trustNet).slice(0, 10);
   const trustSellTop10 = [...instRows].sort((a, b) => a.trustNet - b.trustNet).slice(0, 10);
 
+  let institutionalHistory = loadInstitutionalHistory();
+  institutionalHistory = updateInstitutionalHistory(institutionalHistory, dataDate, instRows);
+  const dualBuyStreak = computeDualBuyStreaks(institutionalHistory, nameLookup);
+  fs.writeFileSync(HISTORY_FILE, JSON.stringify(institutionalHistory));
+
   // ---- 歷史財務資料（自選股 + 熱門排行榜，EPS/毛利率近 14 季、月營收近 24 個月）----
   const financialCodes = [...new Set(
     [...watchlist, ...byValue, ...byVolume, ...byChangePct, ...byChangePctAsc,
-      ...foreignBuyTop10, ...foreignSellTop10, ...trustBuyTop10, ...trustSellTop10].map((r) => r.code)
+      ...foreignBuyTop10, ...foreignSellTop10, ...trustBuyTop10, ...trustSellTop10, ...dualBuyStreak].map((r) => r.code)
   )];
   const epsHistory = {};
   const marginHistory = {};
@@ -382,6 +436,7 @@ async function main() {
     foreignSellTop10,
     trustBuyTop10,
     trustSellTop10,
+    dualBuyStreak,
     epsHistory,
     marginHistory,
     revenueHistory,
