@@ -3,7 +3,7 @@ import fs from "node:fs";
 
 const HISTORY_FILE = "institutional_history.json";
 const HISTORY_DAYS = 30;
-const MIN_DUAL_BUY_STREAK = 2;
+const MIN_BUY_STREAK = 2;
 
 const WATCHLIST = [
   { code: "2330", name: "台積電" },
@@ -301,23 +301,23 @@ function updateInstitutionalHistory(history, dataDate, instRows) {
   return history;
 }
 
-function computeDualBuyStreaks(history, nameLookup) {
+function computeBuyStreaks(history, nameLookup, flagKey) {
   const results = [];
   for (const [code, entry] of Object.entries(history)) {
     let streak = 0;
     for (let i = entry.days.length - 1; i >= 0; i--) {
       const d = entry.days[i];
-      if (d.f && d.t) streak++;
+      if (d[flagKey]) streak++;
       else break;
     }
-    if (streak >= MIN_DUAL_BUY_STREAK) {
+    if (streak >= MIN_BUY_STREAK) {
       const info = nameLookup.get(code);
       if (!info) continue;
       results.push({ ...info, streak });
     }
   }
   results.sort((a, b) => b.streak - a.streak || b.value - a.value);
-  return results.slice(0, 20);
+  return results.slice(0, 10);
 }
 
 function parseIndustryMap(html) {
@@ -444,13 +444,15 @@ async function main() {
 
   let institutionalHistory = loadInstitutionalHistory();
   institutionalHistory = updateInstitutionalHistory(institutionalHistory, dataDate, instRows);
-  const dualBuyStreak = computeDualBuyStreaks(institutionalHistory, nameLookup);
+  const foreignBuyStreak = computeBuyStreaks(institutionalHistory, nameLookup, "f");
+  const trustBuyStreak = computeBuyStreaks(institutionalHistory, nameLookup, "t");
   fs.writeFileSync(HISTORY_FILE, JSON.stringify(institutionalHistory));
 
   // ---- 歷史財務資料（自選股 + 熱門排行榜，EPS/毛利率近 14 季、月營收近 24 個月）----
   const financialCodes = [...new Set(
     [...watchlist, ...byValue, ...byVolume, ...byChangePct, ...byChangePctAsc,
-      ...foreignBuyTop10, ...foreignSellTop10, ...trustBuyTop10, ...trustSellTop10, ...dualBuyStreak].map((r) => r.code)
+      ...foreignBuyTop10, ...foreignSellTop10, ...trustBuyTop10, ...trustSellTop10,
+      ...foreignBuyStreak, ...trustBuyStreak].map((r) => r.code)
   )];
   const epsHistory = {};
   const marginHistory = {};
@@ -492,7 +494,8 @@ async function main() {
     foreignSellTop10,
     trustBuyTop10,
     trustSellTop10,
-    dualBuyStreak,
+    foreignBuyStreak,
+    trustBuyStreak,
     epsHistory,
     marginHistory,
     revenueHistory,
