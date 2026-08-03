@@ -2,7 +2,7 @@ name: Update TW Stock Dashboard Data
 
 on:
   schedule:
-    - cron: '5 14 * * 1-5'
+    - cron: '50 9 * * 1-5'
   workflow_dispatch: {}
 
 permissions:
