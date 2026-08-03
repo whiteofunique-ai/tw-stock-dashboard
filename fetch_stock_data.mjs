@@ -150,6 +150,75 @@ const parseNum = (v) => {
   return Number.isNaN(n) ? 0 : n;
 };
 
+function taipeiDateStr(offsetDays) {
+  // 目前 UTC 時間 + 8 小時 = 台北時間，再往回推 offsetDays 天，回傳 YYYYMMDD
+  const now = new Date(Date.now() + 8 * 60 * 60 * 1000 - offsetDays * 24 * 60 * 60 * 1000);
+  const y = now.getUTCFullYear();
+  const m = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(now.getUTCDate()).padStart(2, "0");
+  return `${y}${m}${d}`;
+}
+
+function yyyymmddToISO(s) {
+  return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+}
+
+function parseChangeSign(html) {
+  if (!html) return 0;
+  if (html.includes("color:red")) return 1;
+  if (html.includes("color:green")) return -1;
+  return 0;
+}
+
+// 上市當日收盤行情（比 STOCK_DAY_ALL 這份彙總檔更新得快，收盤後當天通常就有資料）
+async function fetchTwseSameDayReport(maxLookback = 7) {
+  for (let offset = 0; offset <= maxLookback; offset++) {
+    const dateStr = taipeiDateStr(offset);
+    const url = `https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=${dateStr}&type=ALLBUT0999&response=json`;
+    try {
+      const json = await fetchJson(url);
+      if (json.stat !== "OK" || !Array.isArray(json.tables)) continue;
+
+      const indexTable = json.tables.find((t) => (t.title || "").includes("價格指數(臺灣證券交易所)"));
+      const taiexRow = indexTable?.data?.find((r) => r[0] === "發行量加權股價指數");
+      if (!taiexRow) continue;
+
+      const stockTable = json.tables.find((t) => (t.title || "").includes("每日收盤行情"));
+      if (!stockTable) continue;
+
+      const dataDate = yyyymmddToISO(dateStr);
+      const taiexClose = parseNum(taiexRow[1]);
+      const taiexChangeSign = parseChangeSign(taiexRow[2]);
+      const taiexChange = taiexChangeSign * parseNum(taiexRow[3]);
+
+      const stockRows = stockTable.data
+        .filter((r) => isCommonStock(r[0]))
+        .map((r) => {
+          const close = parseNum(r[8]);
+          const changeSign = parseChangeSign(r[9]);
+          const change = changeSign * parseNum(r[10]);
+          const prevClose = close - change;
+          return {
+            market: "上市",
+            code: r[0],
+            name: r[1],
+            close,
+            change,
+            changePct: prevClose ? (change / prevClose) * 100 : 0,
+            volume: parseNum(r[2]),
+            value: parseNum(r[4]),
+            date: dataDate,
+          };
+        });
+
+      return { dataDate, taiexClose, taiexChange, taiexChangePct: (taiexChange / (taiexClose - taiexChange)) * 100, stockRows };
+    } catch {
+      // 這個日期抓不到（可能還沒收盤或非交易日），往前一天再試
+    }
+  }
+  return null;
+}
+
 async function fetchInstitutionalByStock(queryDate) {
   const netByCode = new Map();
 
@@ -273,8 +342,8 @@ function parseIndustryMap(html) {
 }
 
 async function main() {
-  const [twseStocks, twseIndex, tpexStocks, isinTwseHtml, isinTpexHtml, newsTw, newsUs] = await Promise.all([
-    fetchJson("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"),
+  const [twseReport, twseIndexHist, tpexStocks, isinTwseHtml, isinTpexHtml, newsTw, newsUs] = await Promise.all([
+    fetchTwseSameDayReport(),
     fetchJson("https://openapi.twse.com.tw/v1/indicesReport/MI_5MINS_HIST"),
     fetchJson("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"),
     fetchText("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"),
@@ -283,37 +352,22 @@ async function main() {
     fetchNews("US stock market", "en-US", "US", "US:en", 5),
   ]);
 
+  if (!twseReport) {
+    throw new Error("無法取得上市當日收盤行情（MI_INDEX），已嘗試回推 7 天皆失敗");
+  }
+
   const industryMap = { ...parseIndustryMap(isinTwseHtml), ...parseIndustryMap(isinTpexHtml) };
 
-  // ---- 大盤指數 ----
-  const idxSorted = [...twseIndex].sort((a, b) => (a.Date > b.Date ? 1 : -1));
-  const latestIdx = idxSorted[idxSorted.length - 1];
-  const prevIdx = idxSorted[idxSorted.length - 2];
-  const taiexClose = num(latestIdx.ClosingIndex);
-  const taiexPrevClose = num(prevIdx.ClosingIndex);
-  const taiexChange = taiexClose - taiexPrevClose;
-  const taiexChangePct = (taiexChange / taiexPrevClose) * 100;
+  // ---- 大盤指數（當日）----
+  const taiexClose = twseReport.taiexClose;
+  const taiexChange = twseReport.taiexChange;
+  const taiexChangePct = twseReport.taiexChangePct;
 
   // ---- 上市股票整理 ----
-  const twseRows = twseStocks
-    .filter((r) => isCommonStock(r.Code))
-    .map((r) => {
-      const close = num(r.ClosingPrice);
-      const change = num(r.Change);
-      const prevClose = close - change;
-      return {
-        market: "上市",
-        code: r.Code,
-        name: r.Name,
-        industry: industryMap[r.Code] || null,
-        close,
-        change,
-        changePct: prevClose ? (change / prevClose) * 100 : 0,
-        volume: num(r.TradeVolume),
-        value: num(r.TradeValue),
-        date: rocDateToISO(r.Date),
-      };
-    });
+  const twseRows = twseReport.stockRows.map((r) => ({
+    ...r,
+    industry: industryMap[r.code] || null,
+  }));
 
   // ---- 上櫃股票整理 ----
   const tpexRows = tpexStocks
@@ -369,7 +423,7 @@ async function main() {
     .map((s) => ({ ...s, net: s.up - s.down }))
     .sort((a, b) => b.net - a.net);
 
-  const dataDate = allRows[0]?.date || rocDateToISO(latestIdx.Date);
+  const dataDate = twseReport.dataDate;
   const queryDate = isoToYyyymmdd(dataDate);
 
   // ---- 三大法人買賣超（大盤摘要 + 個股買賣超前10）----
@@ -410,10 +464,12 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 60));
   }
 
-  const taiexHistory = idxSorted.map((r) => ({
-    date: rocDateToISO(r.Date),
-    close: num(r.ClosingIndex),
-  }));
+  // 過去日期用 MI_5MINS_HIST（已定案，穩定），最新一天一律用 twseReport 這個較快的來源蓋過去
+  const taiexHistory = [...twseIndexHist]
+    .map((r) => ({ date: rocDateToISO(r.Date), close: num(r.ClosingIndex) }))
+    .filter((r) => r.date !== dataDate)
+    .sort((a, b) => (a.date > b.date ? 1 : a.date < b.date ? -1 : 0));
+  taiexHistory.push({ date: dataDate, close: taiexClose });
 
   const output = {
     updatedAt: new Date().toISOString(),
