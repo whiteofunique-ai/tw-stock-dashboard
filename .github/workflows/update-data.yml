@@ -19,7 +19,7 @@ jobs:
           node-version: '20'
 
       - name: Fetch latest stock data
-        run: node fetch_stock_data.mjs > stock_data.json 2> fetch_err.log
+        run: node fetch_stock_data.mjs > stock_data.json
 
       - name: Splice data into dashboard
         run: node splice_data.mjs
