@@ -5,6 +5,9 @@ const HISTORY_FILE = "institutional_history.json";
 const HISTORY_DAYS = 30;
 const MIN_BUY_STREAK = 2;
 
+const TAIEX_HISTORY_FILE = "taiex_history.json";
+const TAIEX_HISTORY_DAYS = 60;
+
 const WATCHLIST = [
   { code: "2330", name: "台積電" },
   { code: "2454", name: "聯發科" },
@@ -277,6 +280,27 @@ async function fetchMarketInstitutionalSummary(queryDate) {
   }
 }
 
+// ---- 加權指數走勢（跨日滾動歷史，存在 taiex_history.json）----
+// 注意：MI_5MINS_HIST 這個 API 只會回傳「當月至今」的資料，一到月初就會斷頭，
+// 不能直接拿來當作近 20 日走勢的資料源，所以改成自己每天累積存檔。
+function loadTaiexHistory() {
+  try {
+    const data = JSON.parse(fs.readFileSync(TAIEX_HISTORY_FILE, "utf8"));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+function updateTaiexHistory(history, dataDate, close) {
+  const merged = new Map(history.map((r) => [r.date, r.close]));
+  merged.set(dataDate, close);
+  return [...merged.entries()]
+    .map(([date, close]) => ({ date, close }))
+    .sort((a, b) => (a.date > b.date ? 1 : a.date < b.date ? -1 : 0))
+    .slice(-TAIEX_HISTORY_DAYS);
+}
+
 // ---- 外資／投信連買追蹤（跨日滾動歷史，存在 institutional_history.json）----
 function loadInstitutionalHistory() {
   try {
@@ -342,9 +366,8 @@ function parseIndustryMap(html) {
 }
 
 async function main() {
-  const [twseReport, twseIndexHist, tpexStocks, isinTwseHtml, isinTpexHtml, newsTw, newsUs] = await Promise.all([
+  const [twseReport, tpexStocks, isinTwseHtml, isinTpexHtml, newsTw, newsUs] = await Promise.all([
     fetchTwseSameDayReport(),
-    fetchJson("https://openapi.twse.com.tw/v1/indicesReport/MI_5MINS_HIST"),
     fetchJson("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"),
     fetchText("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"),
     fetchText("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"),
@@ -466,12 +489,8 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 60));
   }
 
-  // 過去日期用 MI_5MINS_HIST（已定案，穩定），最新一天一律用 twseReport 這個較快的來源蓋過去
-  const taiexHistory = [...twseIndexHist]
-    .map((r) => ({ date: rocDateToISO(r.Date), close: num(r.ClosingIndex) }))
-    .filter((r) => r.date !== dataDate)
-    .sort((a, b) => (a.date > b.date ? 1 : a.date < b.date ? -1 : 0));
-  taiexHistory.push({ date: dataDate, close: taiexClose });
+  const taiexHistory = updateTaiexHistory(loadTaiexHistory(), dataDate, taiexClose);
+  fs.writeFileSync(TAIEX_HISTORY_FILE, JSON.stringify(taiexHistory));
 
   const output = {
     updatedAt: new Date().toISOString(),
