@@ -143,6 +143,33 @@ async function fetchMonthlyRevenue(code, monthsBack) {
   }
 }
 
+async function fetchPriceHistory(code, tradingDaysBack) {
+  const start = new Date();
+  start.setDate(start.getDate() - Math.ceil(tradingDaysBack * 1.6) - 10); // 多留緩衝，扣掉週末假日後仍夠 tradingDaysBack 天
+  const startDate = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, "0")}-${String(start.getDate()).padStart(2, "0")}`;
+  const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${code}&start_date=${startDate}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const json = await res.json();
+    if (json.status !== 200 || !Array.isArray(json.data)) return [];
+    return json.data
+      .sort((a, b) => (a.date > b.date ? 1 : -1))
+      .map((r) => ({
+        date: r.date,
+        open: r.open,
+        high: r.max,
+        low: r.min,
+        close: r.close,
+        change: r.spread,
+        volume: r.Trading_Volume,
+      }))
+      .slice(-tradingDaysBack);
+  } catch {
+    return [];
+  }
+}
+
 function isoToYyyymmdd(iso) {
   return iso.replace(/-/g, "");
 }
@@ -480,12 +507,15 @@ async function main() {
   const epsHistory = {};
   const marginHistory = {};
   const revenueHistory = {};
+  const priceHistory = {};
   for (const code of financialCodes) {
     const financials = await fetchFinancials(code, 14);
     epsHistory[code] = financials.eps;
     marginHistory[code] = financials.margin;
     await new Promise((resolve) => setTimeout(resolve, 60));
     revenueHistory[code] = await fetchMonthlyRevenue(code, 24);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    priceHistory[code] = await fetchPriceHistory(code, 60);
     await new Promise((resolve) => setTimeout(resolve, 60));
   }
 
@@ -518,6 +548,7 @@ async function main() {
     epsHistory,
     marginHistory,
     revenueHistory,
+    priceHistory,
   };
 
   console.log(JSON.stringify(output, null, 2));
