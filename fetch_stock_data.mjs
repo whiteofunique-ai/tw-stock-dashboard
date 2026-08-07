@@ -8,6 +8,9 @@ const MIN_BUY_STREAK = 2;
 const TAIEX_HISTORY_FILE = "taiex_history.json";
 const TAIEX_HISTORY_DAYS = 60;
 
+const TPEX_INDEX_HISTORY_FILE = "tpex_index_history.json";
+const TPEX_INDEX_HISTORY_DAYS = 60;
+
 const WATCHLIST = [
   { code: "2330", name: "台積電" },
   { code: "2454", name: "聯發科" },
@@ -140,6 +143,33 @@ async function fetchMonthlyRevenue(code, monthsBack) {
       .slice(-monthsBack);
   } catch {
     return [];
+  }
+}
+
+// 上櫃指數（/tpex_index 本身就有近幾日的 OHLC，但只保留短短幾天，用來持續累積歷史）
+async function fetchTpexIndex(dataDate) {
+  try {
+    const json = await fetchJson("https://www.tpex.org.tw/openapi/v1/tpex_index");
+    if (!Array.isArray(json) || json.length === 0) return null;
+    const rows = json.map((r) => ({
+      date: yyyymmddToISO(r.Date),
+      open: parseNum(r.Open),
+      high: parseNum(r.High),
+      low: parseNum(r.Low),
+      close: parseNum(r.Close),
+    }));
+    const wantDate = dataDate;
+    const today = rows.find((r) => r.date === wantDate) || rows[rows.length - 1];
+    const change = parseNum(json.find((r) => yyyymmddToISO(r.Date) === today.date)?.Change ?? json[json.length - 1].Change);
+    const prevClose = today.close - change;
+    return {
+      close: today.close,
+      change,
+      changePct: prevClose ? (change / prevClose) * 100 : 0,
+      rows,
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -307,9 +337,15 @@ async function fetchMarketInstitutionalSummary(queryDate) {
   }
 }
 
-// ---- 加權指數走勢（跨日滾動歷史，存在 taiex_history.json）----
-// 注意：MI_5MINS_HIST 這個 API 只會回傳「當月至今」的資料，一到月初就會斷頭，
-// 不能直接拿來當作近 20 日走勢的資料源，所以改成自己每天累積存檔。
+// ---- 加權指數走勢／K線（跨日滾動歷史，存在 taiex_history.json）----
+// 注意：MI_5MINS_HIST 這個 API 只會回傳近幾天的資料，不能當作近 20 日走勢的唯一資料源，
+// 所以改成自己每天累積存檔；close 一律以 MI_INDEX 當天authoritative 收盤為準，
+// open/high/low 則儘量用 MI_5MINS_HIST 目前有的資料回補（它的「今天」常常會晚一天才出現，
+// 所以今天的 open/high/low 會先用 close 頂著，等明天資料出來後再回補更新）。
+function withDailyChange(sortedRows) {
+  return sortedRows.map((r, i) => ({ ...r, change: i > 0 ? r.close - sortedRows[i - 1].close : 0 }));
+}
+
 function loadTaiexHistory() {
   try {
     const data = JSON.parse(fs.readFileSync(TAIEX_HISTORY_FILE, "utf8"));
@@ -319,13 +355,56 @@ function loadTaiexHistory() {
   }
 }
 
-function updateTaiexHistory(history, dataDate, close) {
-  const merged = new Map(history.map((r) => [r.date, r.close]));
-  merged.set(dataDate, close);
-  return [...merged.entries()]
-    .map(([date, close]) => ({ date, close }))
+function updateTaiexHistory(history, dataDate, close, ohlcByDate) {
+  // 舊版只存 close 沒有 open/high/low 的資料，先補成平盤 K 棒，避免圖表算 min/max 出現 NaN
+  const map = new Map(
+    history.map((r) => [
+      r.date,
+      { date: r.date, close: r.close, open: r.open ?? r.close, high: r.high ?? r.close, low: r.low ?? r.close },
+    ])
+  );
+  const todayOhlc = ohlcByDate?.get(dataDate);
+  map.set(dataDate, {
+    date: dataDate,
+    close,
+    open: todayOhlc ? todayOhlc.open : close,
+    high: todayOhlc ? todayOhlc.high : close,
+    low: todayOhlc ? todayOhlc.low : close,
+  });
+  if (ohlcByDate) {
+    for (const [date, ohlc] of ohlcByDate.entries()) {
+      const existing = map.get(date);
+      if (existing) {
+        existing.open = ohlc.open;
+        existing.high = ohlc.high;
+        existing.low = ohlc.low;
+      }
+    }
+  }
+  const sorted = [...map.values()]
     .sort((a, b) => (a.date > b.date ? 1 : a.date < b.date ? -1 : 0))
     .slice(-TAIEX_HISTORY_DAYS);
+  return withDailyChange(sorted);
+}
+
+// ---- 上櫃指數 K 線（跨日滾動歷史，存在 tpex_index_history.json）----
+// /tpex_index 本身就有 OHLC，只是只保留近幾天，所以一樣用累積存檔的方式保留較長天數。
+function loadTpexIndexHistory() {
+  try {
+    const data = JSON.parse(fs.readFileSync(TPEX_INDEX_HISTORY_FILE, "utf8"));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+function updateTpexIndexHistory(history, rows) {
+  const map = new Map(history.map((r) => [r.date, r]));
+  for (const row of rows) map.set(row.date, row);
+  const sorted = [...map.values()]
+    .sort((a, b) => (a.date > b.date ? 1 : a.date < b.date ? -1 : 0))
+    .slice(-TPEX_INDEX_HISTORY_DAYS);
+  return withDailyChange(sorted);
 }
 
 // ---- 外資／投信連買追蹤（跨日滾動歷史，存在 institutional_history.json）----
@@ -393,8 +472,9 @@ function parseIndustryMap(html) {
 }
 
 async function main() {
-  const [twseReport, tpexStocks, isinTwseHtml, isinTpexHtml, newsTw, newsUs] = await Promise.all([
+  const [twseReport, taiexOhlcRaw, tpexStocks, isinTwseHtml, isinTpexHtml, newsTw, newsUs] = await Promise.all([
     fetchTwseSameDayReport(),
+    fetchJson("https://openapi.twse.com.tw/v1/indicesReport/MI_5MINS_HIST").catch(() => []),
     fetchJson("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"),
     fetchText("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"),
     fetchText("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"),
@@ -405,6 +485,17 @@ async function main() {
   if (!twseReport) {
     throw new Error("無法取得上市當日收盤行情（MI_INDEX），已嘗試回推 7 天皆失敗");
   }
+
+  const dataDate = twseReport.dataDate;
+  const tpexIndex = await fetchTpexIndex(dataDate);
+
+  // MI_5MINS_HIST 用來回補加權指數的 open/high/low（它常常會晚一兩天才更新到最新一天）
+  const taiexOhlcByDate = new Map(
+    (Array.isArray(taiexOhlcRaw) ? taiexOhlcRaw : []).map((r) => [
+      rocDateToISO(r.Date),
+      { open: num(r.OpeningIndex), high: num(r.HighestIndex), low: num(r.LowestIndex) },
+    ])
+  );
 
   const industryMap = { ...parseIndustryMap(isinTwseHtml), ...parseIndustryMap(isinTpexHtml) };
 
@@ -473,7 +564,6 @@ async function main() {
     .map((s) => ({ ...s, net: s.up - s.down }))
     .sort((a, b) => b.net - a.net);
 
-  const dataDate = twseReport.dataDate;
   const queryDate = isoToYyyymmdd(dataDate);
 
   // ---- 三大法人買賣超（大盤摘要 + 個股買賣超前10）----
@@ -519,8 +609,11 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 60));
   }
 
-  const taiexHistory = updateTaiexHistory(loadTaiexHistory(), dataDate, taiexClose);
+  const taiexHistory = updateTaiexHistory(loadTaiexHistory(), dataDate, taiexClose, taiexOhlcByDate);
   fs.writeFileSync(TAIEX_HISTORY_FILE, JSON.stringify(taiexHistory));
+
+  const tpexIndexHistory = updateTpexIndexHistory(loadTpexIndexHistory(), tpexIndex?.rows || []);
+  fs.writeFileSync(TPEX_INDEX_HISTORY_FILE, JSON.stringify(tpexIndexHistory));
 
   const output = {
     updatedAt: new Date().toISOString(),
@@ -531,6 +624,9 @@ async function main() {
       changePct: taiexChangePct,
       history: taiexHistory,
     },
+    tpexIndex: tpexIndex
+      ? { close: tpexIndex.close, change: tpexIndex.change, changePct: tpexIndex.changePct, history: tpexIndexHistory }
+      : null,
     news: { tw: newsTw, us: newsUs },
     watchlist,
     topByValue: byValue,
