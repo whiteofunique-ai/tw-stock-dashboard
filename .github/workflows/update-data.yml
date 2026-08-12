@@ -18,8 +18,22 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Fetch latest stock data
-        run: node fetch_stock_data.mjs > stock_data.json
+      - name: Fetch latest stock data (with retry)
+        run: |
+          for i in 1 2 3; do
+            echo "Attempt $i..."
+            if node fetch_stock_data.mjs > stock_data.json; then
+              echo "Fetch succeeded on attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i failed"
+            rm -f stock_data.json
+            if [ "$i" -lt 3 ]; then
+              sleep 60
+            fi
+          done
+          echo "All 3 attempts failed"
+          exit 1
 
       - name: Splice data into dashboard
         run: node splice_data.mjs
